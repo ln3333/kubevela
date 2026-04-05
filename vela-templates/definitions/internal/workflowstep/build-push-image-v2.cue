@@ -137,6 +137,20 @@ template: {
 		}
 	}
 
+	// Pod Failed: fail the step; otherwise ConditionalWait would wait forever (continue never true).
+	fail: {
+		if read.$returns.value.status != _|_ if read.$returns.value.status.phase == "Failed" if read.$returns.value.status.message != _|_ {
+			podFailed: builtin.#Fail & {
+				$params: message: "builder pod failed: \(read.$returns.value.status.message)"
+			}
+		}
+		if read.$returns.value.status != _|_ if read.$returns.value.status.phase == "Failed" if read.$returns.value.status.message == _|_ {
+			podFailedNoMsg: builtin.#Fail & {
+				$params: message: "builder pod failed (phase Failed)"
+			}
+		}
+	}
+
 	wait: builtin.#ConditionalWait & {
 		if read.$returns.value.status != _|_ {
 			$params: continue: read.$returns.value.status.phase == "Succeeded"
