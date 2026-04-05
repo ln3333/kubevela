@@ -8,7 +8,7 @@ import (
 "build-push-image-v2": {
 	alias: ""
 	attributes: {}
-	description: "Build and push image from GitLab SSH repo using a remote Docker daemon."
+	description: "Build and push image from a Git SSH repo (git@host:path) using a remote Docker daemon."
 	annotations: {
 		"category": "CI Integration"
 	}
@@ -32,7 +32,8 @@ template: {
 		}
 	}
 
-	// Create Secret from inline sshKey first; builder references $returns so execution order is preserved.
+	// Base64-encoded PEM stored as plain string; decoded in builder entrypoint.sh (not in CUE).
+	// Create Secret from ssh key material first; builder references $returns so execution order is preserved.
 	sshSecretApply: kube.#Apply & {
 		$params: {
 			value: {
@@ -44,7 +45,7 @@ template: {
 				}
 				type: "Opaque"
 				stringData: {
-					"ssh-privatekey": parameter.sshKey
+					"ssh-privatekey": parameter.sshKeyBase64
 				}
 			}
 		}
@@ -84,7 +85,7 @@ template: {
 							volumeMounts: [
 								{
 									name:      "ssh-key"
-									mountPath: "/root/.ssh/id_rsa"
+									mountPath: "/tmp/vela-ssh-key-secret"
 									subPath:   "ssh-privatekey"
 									readOnly:  true
 								},
@@ -143,7 +144,7 @@ template: {
 	}
 
 	parameter: {
-		// +usage=Specify the GitLab SSH URL, e.g. ssh://git@gitlab.example.com/group/repo.git
+		// +usage=Git SSH URL in scp form only, e.g. git@github.com:org/repo.git or git@gitlab.example.com:group/repo.git
 		gitURL: string
 		// +usage=Specify the git branch to build from
 		gitBranch: *"main" | string
@@ -163,8 +164,8 @@ template: {
 		dockerfile?: string
 		// +usage=Specify extra docker build args, e.g. ["KEY1=VAL1", "KEY2=VAL2"]
 		buildArgs?: [...string]
-		// +usage=SSH private key PEM for GitLab (ssh://). A Secret is created in the application namespace before the builder Pod runs; avoid committing this value to git.
-		sshKey: string
+		// +usage=Base64-encoded SSH private key PEM (single line, no newlines). Example: base64 -w0 < id_rsa or macOS: base64 -i id_rsa | tr -d '\n'. Decoded in builder entrypoint.sh.
+		sshKeyBase64: string
 		// +usage=Specify the builder image that contains docker CLI, git, and entrypoint.sh
 		builderImage: *"harbor.dev.example.com/infra/vela-builder:latest" | string
 	}

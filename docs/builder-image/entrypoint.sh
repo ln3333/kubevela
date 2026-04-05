@@ -1,9 +1,8 @@
 #!/bin/bash
 set -eo pipefail
-set -x
 
 # ── Required env vars ──
-# GIT_URL        ssh:// GitLab URL
+# GIT_URL        scp-style Git SSH URL: git@host:org/repo.git
 # CODE_TYPE      python3.12-pip | java21-maven | node-yarn | node-npm
 # REPO           image repo path, e.g. "team"
 # IMAGE_NAME     image name, e.g. "my-app"
@@ -36,26 +35,43 @@ export DOCKER_HOST="${DOCKER_HOST:-tcp://192.168.1.1:2375}"
 FULL_IMAGE="${REGISTRY}/${REPO}/${IMAGE_NAME}:${IMAGE_TAG}"
 
 # ────────────────────────────────────────────────────
-# 2. Configure SSH for GitLab access
+# 2. Configure SSH for Git access (scp-style git@host:path)
 # ────────────────────────────────────────────────────
-# Secret subPath mounts are often read-only; chmod on the mount fails. The Pod sets
-# defaultMode 0600 on the volume, but ssh still needs a writable key file with 0600.
-# Copy to /tmp and point git at it via GIT_SSH_COMMAND.
+# Secret holds base64-encoded PEM (workflow parameter sshKeyBase64), mounted at a temp path (not ~/.ssh).
+# SubPath mount may be read-only; decode to a writable PEM file for ssh.
 log "Configuring SSH..."
 mkdir -p /root/.ssh
-SSH_KEY_SRC="/root/.ssh/id_rsa"
-SSH_KEY_USE="/tmp/vela-git-ssh-key"
+SSH_KEY_SRC="/tmp/vela-ssh-key-secret"
+SSH_KEY_USE="/tmp/vela-git-ssh-key.pem"
 if [ ! -f "${SSH_KEY_SRC}" ]; then
     echo "ERROR: SSH private key not found at ${SSH_KEY_SRC}" >&2
     exit 1
 fi
-cp "${SSH_KEY_SRC}" "${SSH_KEY_USE}"
-chmod 600 "${SSH_KEY_USE}"
-export GIT_SSH_COMMAND="ssh -i ${SSH_KEY_USE} -o IdentitiesOnly=yes -o UserKnownHostsFile=/root/.ssh/known_hosts"
 
-GIT_HOST=$(echo "${GIT_URL}" | sed -E 's|ssh://[^@]+@([^:/]+).*|\1|')
-ssh-keyscan -H "${GIT_HOST}" >> /root/.ssh/known_hosts 2>/dev/null
-log "SSH configured for host ${GIT_HOST}"
+log "Decoding base64 SSH key from Secret"
+if ! base64 -d < "${SSH_KEY_SRC}" > "${SSH_KEY_USE}" 2>/dev/null; then
+    echo "ERROR: failed to base64-decode SSH key; check sshKeyBase64 (single-line base64 of PEM)" >&2
+    exit 1
+fi
+chmod 600 "${SSH_KEY_USE}"
+
+GIT_HOST=""
+if [[ "${GIT_URL}" =~ ^git@([^:]+): ]]; then
+    GIT_HOST="${BASH_REMATCH[1]}"
+else
+    echo "ERROR: GIT_URL must be scp-style git@host:org/repo (e.g. git@github.com:org/k8less.git); got: ${GIT_URL}" >&2
+    exit 1
+fi
+
+SSH_KEYSCAN_ERR="/tmp/vela-ssh-keyscan.err"
+log "Recording host key for ${GIT_HOST}"
+if ! ssh-keyscan -H "${GIT_HOST}" >> /root/.ssh/known_hosts 2>"${SSH_KEYSCAN_ERR}"; then
+    log "ERROR: ssh-keyscan failed for ${GIT_HOST}: $(tr '\n' ' ' < "${SSH_KEYSCAN_ERR}")"
+    exit 1
+fi
+rm -f "${SSH_KEYSCAN_ERR}"
+
+export GIT_SSH_COMMAND="ssh -i ${SSH_KEY_USE} -o IdentitiesOnly=yes -o UserKnownHostsFile=/root/.ssh/known_hosts"
 
 # ────────────────────────────────────────────────────
 # 3. Clone repository

@@ -404,7 +404,7 @@ spec:
 
 ### 概述
 
-`build-push-image-v2` 是对内置 `build-push-image`（基于 Kaniko）的替代方案，改用**远端 Docker daemon** 构建镜像，支持从 **GitLab SSH** 拉取代码，并按 4 种代码类型自动生成 Dockerfile。
+`build-push-image-v2` 是对内置 `build-push-image`（基于 Kaniko）的替代方案，改用**远端 Docker daemon** 构建镜像，支持从 **Git SSH**（`git@host:path`）拉取代码，并按 4 种代码类型自动生成 Dockerfile。
 
 ### 与 build-push-image (Kaniko) 的对比
 
@@ -426,10 +426,10 @@ spec:
     ▼
 build-push-image-v2.cue
     │
-    ├─ kube.#Apply → 从 properties.sshKey 创建 Opaque Secret（键 ssh-privatekey）
+    ├─ kube.#Apply → 从 properties.sshKeyBase64 创建 Opaque Secret（键 ssh-privatekey，内容为 Base64 文本）
     ├─ kube.#Apply → 创建 builder Pod
     │      ├─ env: GIT_URL, GIT_BRANCH, CODE_TYPE, DOCKER_HOST, REGISTRY, REPO, IMAGE_NAME, IMAGE_TAG, ...
-    │      └─ volume: 上述 Secret → /root/.ssh/id_rsa（subPath ssh-privatekey）
+    │      └─ volume: Secret → `/tmp/vela-ssh-key-secret`（subPath ssh-privatekey）；entrypoint 解码后使用 `/tmp/vela-git-ssh-key.pem`
     │
     ├─ util.#Log → 采集构建日志
     ├─ kube.#Read → 读取 Pod 状态
@@ -445,7 +445,7 @@ SSH 配置 → git clone → Dockerfile 检测/生成 → docker build (远端) 
 
 | 参数 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `gitURL` | 是 | - | GitLab SSH URL，如 `ssh://git@gitlab.example.com/group/repo.git` |
+| `gitURL` | 是 | - | Git SSH URL（scp 形式），如 `git@github.com:org/repo.git` 或 `git@gitlab.example.com:group/repo.git` |
 | `gitBranch` | 否 | `"main"` | Git 分支 |
 | `codeType` | 是 | - | 代码类型：`python3.12-pip` / `java21-maven` / `node-yarn` / `node-npm` |
 | `dockerHost` | 否 | `"tcp://192.168.1.1:2375"` | 远端 Docker daemon 地址 |
@@ -455,12 +455,21 @@ SSH 配置 → git clone → Dockerfile 检测/生成 → docker build (远端) 
 | `imageTag` | 否 | `"latest"` | 镜像 tag |
 | `dockerfile` | 否 | - | 自定义 Dockerfile 相对路径；不填则按 `codeType` 自动生成 |
 | `buildArgs` | 否 | - | 额外 build-arg 列表，如 `["KEY1=VAL1"]` |
-| `sshKey` | 是 | - | SSH 私钥 PEM（用于 `ssh://` GitLab）。工作流会先在应用命名空间创建 **Opaque Secret**（键名 `ssh-privatekey`），再拉起 builder Pod 挂载；**勿将私钥写入 Git 或提交到公开仓库** |
+| `sshKeyBase64` | 是 | - | **单行** Base64：对 PEM 私钥整段编码（无换行）。VelaUX 单行输入友好；解码在 `entrypoint.sh` |
 | `builderImage` | 否 | `"harbor.dev.example.com/infra/vela-builder:latest"` | 构建镜像 |
 
 自动创建的 Secret 名称：`{Application 名}-{stepSessionID}-git-ssh`（与 `context` 一致，每次执行唯一）。
 
 最终推送的镜像地址：`${registry}/${repo}/${imageName}:${imageTag}`
+
+#### 如何生成 `sshKeyBase64`
+
+```bash
+base64 -w0 < ~/.ssh/id_rsa          # Linux GNU
+base64 -i ~/.ssh/id_rsa | tr -d '\n'  # macOS
+```
+
+将输出粘贴到 `properties.sshKeyBase64`。Secret 中存的是 **Base64 文本**（CUE 不在此解码，避免 marshal 问题）；**解码在 `entrypoint.sh` 中完成**。
 
 ### 代码类型与自动生成的 Dockerfile
 
@@ -481,7 +490,7 @@ SSH 配置 → git clone → Dockerfile 检测/生成 → docker build (远端) 
    docker push harbor.dev.example.com/infra/vela-builder:latest
    ```
 
-2. **SSH 私钥**：在 Application 的 `properties.sshKey` 中提供 PEM 内容（或通过 VelaUX 表单录入）。工作流步骤会 **自动创建** 上述 Secret，**无需**再手工 `kubectl create secret`（除非你希望改用其它方案自行管理凭据）。
+2. **SSH 私钥**：在 `properties.sshKeyBase64` 填写 **单行 Base64**（见上文）。工作流会 **自动创建** Secret，**无需**再手工 `kubectl create secret`。
 
 3. **确保远端 Docker daemon 可达**（默认 `192.168.1.1:2375`）。
 
@@ -541,7 +550,7 @@ kubectl apply -f build-push-image-v2.yaml
 |----|------|
 | Application 引用 | `workflow.steps[].type: build-push-image-v2` 与 CR 名称一致即可 |
 | Builder 镜像 | 定义只负责下发 Secret 与 Pod；仍需按上文构建并推送 `builderImage` |
-| `sshKey` 安全 | 私钥会进入 Application 资源与 etcd；生产环境建议配合 SealedSecret、External Secrets、或仅通过 CI 注入 properties |
+| `sshKeyBase64` 安全 | 凭据会进入 Application 与 etcd；生产环境建议 SealedSecret、External Secrets、CI 注入 |
 | 更新定义 | 修改 CUE 后再次执行 `vela def apply` 覆盖同名 CR |
 
 ### 使用示例
@@ -557,17 +566,14 @@ spec:
       - name: build-image
         type: build-push-image-v2
         properties:
-          gitURL: "ssh://git@gitlab.example.com/team/my-app.git"
+          gitURL: "git@gitlab.example.com:team/my-app.git"
           gitBranch: "develop"
           codeType: "java21-maven"
           repo: "team"
           imageName: "my-app"
           imageTag: "v1.0.0"
-          # 多行 PEM；勿提交到 Git，可用 CI 注入或外部密钥方案
-          sshKey: |
-            -----BEGIN OPENSSH PRIVATE KEY-----
-            ...
-            -----END OPENSSH PRIVATE KEY-----
+          # 单行 base64：base64 -w0 < id_rsa 的输出
+          sshKeyBase64: "LS0tLS1CRUdJTiBPUEVOU1NII..."
 ```
 
 ### 源码文件
